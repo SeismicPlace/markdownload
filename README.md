@@ -42,7 +42,7 @@ You need to do some configurations in order to use this integration.
 
 # External Libraries
 It uses the following libraries:
-- [Readability.js](https://github.com/mozilla/readability) by Mozilla version [0.5.0](https://github.com/mozilla/readability/releases/tag/0.5.0). This library is also used for the Firefox Reader View and it simplifies the page so that only the important parts are clipped. (Licensed under Apache License Version 2.0)
+- [Readability.js](https://github.com/mozilla/readability) by Mozilla version [0.6.0](https://github.com/mozilla/readability/releases/tag/0.6.0). This library is also used for the Firefox Reader View and it simplifies the page so that only the important parts are clipped. (Licensed under Apache License Version 2.0)
 - [Turndown](https://github.com/mixmark-io/turndown) by Dom Christie in version [7.1.3](https://github.com/mixmark-io/turndown/releases/tag/v7.1.3) is used to convert the simplified HTML (from Readability.js) into markdown. (Licensed under MIT License)
 - [Moment.js](https://momentjs.com) version 2.29.4 used to format dates in template variables
 
