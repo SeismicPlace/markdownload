@@ -96,10 +96,17 @@ function getHTMLOfSelection() {
     }
 }
 
+// Runs in every frame. Frames from another origin (ads, video embeds) return null;
+// same-origin frames (e.g. an LMS content viewer) are captured and merged in by the background.
 function getSelectionAndDom() {
+    let sameOrigin;
+    try { sameOrigin = window.top.location.origin === location.origin; } catch { sameOrigin = false; }
+    if (!sameOrigin) return null;
     return {
         selection: getHTMLOfSelection(),
-        dom: getHTMLOfDocument()
+        dom: getHTMLOfDocument(),
+        url: location.href,
+        isTop: window === window.top
     }
 }
 

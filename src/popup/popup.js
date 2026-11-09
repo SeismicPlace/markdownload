@@ -97,32 +97,21 @@ const showOrHideClipOption = selection => {
 }
 
 const clipSite = id => {
-    return browser.tabs.executeScript(id, { code: "getSelectionAndDom()" })
-        .then((result) => {
-            if (result && result[0]) {
-                showOrHideClipOption(result[0].selection);
-                let message = {
-                    type: "clip",
-                    dom: result[0].dom,
-                    selection: result[0].selection
-                }
-                return browser.storage.sync.get(defaultOptions).then(options => {
-                    browser.runtime.sendMessage({
-                        ...message,
-                        ...options
-                    });
-                }).catch(err => {
-                    console.error(err);
-                    showError(err)
-                    return browser.runtime.sendMessage({
-                        ...message,
-                        ...defaultOptions
-                    });
-                }).catch(err => {
-                    console.error(err);
-                    showError(err)
-                });
-            }
+    // runs in every frame; the background merges same-origin iframes into the page (see splitFrames)
+    return browser.tabs.executeScript(id, {
+        code: "typeof getSelectionAndDom === 'function' ? getSelectionAndDom() : null",
+        allFrames: true
+    })
+        .then(async (frames) => {
+            showOrHideClipOption((frames || []).some(f => f?.selection));
+            const options = await browser.storage.sync.get(defaultOptions).catch(() => defaultOptions);
+            // returning this means a failure in the background conversion lands in the catch below
+            // instead of leaving the spinner up forever
+            return browser.runtime.sendMessage({
+                type: "clip",
+                frames: frames,
+                ...options
+            });
         }).catch(err => {
             console.error(err);
             showError(err)
@@ -158,11 +147,11 @@ browser.storage.sync.get(defaultOptions).then(options => {
     var id = tabs[0].id;
     var url = tabs[0].url;
     browser.tabs.executeScript(id, {
-        file: "/browser-polyfill.min.js"
+        file: "/browser-polyfill.min.js", allFrames: true
     })
     .then(() => {
         return browser.tabs.executeScript(id, {
-            file: "/contentScript/contentScript.js"
+            file: "/contentScript/contentScript.js", allFrames: true
         });
     }).then( () => {
         console.info("Successfully injected MarkDownload content script");

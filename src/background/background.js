@@ -21,6 +21,15 @@ function turndown(content, options, article) {
 
   turndownService.use(turndownPluginGfm.gfm)
 
+  // GFM tables can't merge cells: pad colspan cells with empty ones so later columns stay aligned
+  turndownService.addRule('tableCellColspan', {
+    filter: node => (node.nodeName == 'TH' || node.nodeName == 'TD') && node.colSpan > 1,
+    replacement: (content, node) => {
+      const index = Array.prototype.indexOf.call(node.parentNode.childNodes, node);
+      return (index === 0 ? '| ' : ' ') + content + ' |' + ' |'.repeat(node.colSpan - 1);
+    }
+  });
+
   turndownService.keep(['iframe', 'sub', 'sup', 'u', 'ins', 'del', 'small', 'big']);
 
   let imageList = {};
@@ -379,6 +388,9 @@ async function preDownloadImages(imageList, markdown) {
         const xhr = new XMLHttpRequest();
         xhr.open('GET', src);
         xhr.responseType = "blob";
+        // a stalled image server would otherwise hang the whole clip forever
+        xhr.timeout = 30000;
+        xhr.ontimeout = () => reject('Timed out downloading image ' + src);
         xhr.onload = async function () {
           // here's the returned blob
           const blob = xhr.response;
@@ -538,12 +550,14 @@ async function notify(message) {
   // message for initial clipping of the dom
   if (message.type == "clip") {
     // get the article info from the passed in dom
-    const article = await getArticleFromDom(message.dom);
+    const { dom, selection, frames } = splitFrames(message.frames);
+    if (!dom) throw new Error("Couldn't read this page's content.");
+    const article = await getArticleFromDom(dom, frames);
 
     // if selection info was passed in (and we're to clip the selection)
     // replace the article content
-    if (message.selection && message.clipSelection) {
-      article.content = message.selection;
+    if (selection && message.clipSelection) {
+      article.content = selection;
     }
     
     // convert the article to markdown
@@ -661,17 +675,64 @@ async function toggleSetting(setting, options = null) {
 
 // this function ensures the content script is loaded (and loads it if it isn't)
 async function ensureScripts(tabId) {
-  const results = await browser.tabs.executeScript(tabId, { code: "typeof getSelectionAndDom === 'function';" })
-  // The content script's last expression will be true if the function
-  // has been defined. If this is not the case, then we need to run
-  // pageScraper.js to define function getSelectionAndDom.
-  if (!results || results[0] !== true) {
-    await browser.tabs.executeScript(tabId, {file: "/contentScript/contentScript.js"});
+  // injected into every frame so same-origin iframes (e.g. LMS content viewers) can be captured too
+  const results = await browser.tabs.executeScript(tabId, { code: "typeof getSelectionAndDom === 'function';", allFrames: true })
+  if (!results || !results.every(r => r === true)) {
+    await browser.tabs.executeScript(tabId, { file: "/contentScript/contentScript.js", allFrames: true });
   }
 }
 
+// code to run getSelectionAndDom() in every frame (null where the content script isn't loaded)
+const GET_FRAMES_CODE = "typeof getSelectionAndDom === 'function' ? getSelectionAndDom() : null";
+
+// executeScript({allFrames}) gives one result per frame (null for skipped frames).
+// Pull out the top page's html, the first non-empty selection, and the child frames.
+function splitFrames(results) {
+  results = (results || []).filter(r => r?.dom);
+  const top = results.find(r => r.isTop);
+  return {
+    dom: top?.dom,
+    selection: results.find(r => r.selection)?.selection || '',
+    frames: results.filter(r => r !== top)
+  };
+}
+
+// Put each captured frame's body where its <iframe> was, so pages that show their
+// content in an iframe (D2L/Brightspace, many LMS and doc viewers) get clipped.
+function inlineFrames(dom, frames) {
+  const toElement = frame => {
+    const frameDoc = new DOMParser().parseFromString(frame.dom, "text/html");
+    // relative links/images are relative to the frame, not the outer page
+    frameDoc.querySelectorAll('[src], [href]').forEach(el => {
+      for (const attr of ['src', 'href']) {
+        if (!el.hasAttribute(attr)) continue;
+        try { el.setAttribute(attr, new URL(el.getAttribute(attr), frame.url).href); } catch { }
+      }
+    });
+    const div = dom.createElement('div');
+    div.innerHTML = frameDoc.body?.innerHTML || '';
+    return div;
+  };
+
+  // repeat so frames nested inside other frames find their <iframe> once the parent is inlined
+  let pending = frames;
+  let progress = true;
+  while (pending.length && progress) {
+    progress = false;
+    pending = pending.filter(frame => {
+      const iframe = [...dom.querySelectorAll('iframe')].find(f => f.src === frame.url);
+      if (!iframe) return true;
+      iframe.replaceWith(toElement(frame));
+      progress = true;
+      return false;
+    });
+  }
+  // ponytail: iframes hidden inside shadow DOM can't be matched, so their content goes at the end
+  pending.forEach(frame => dom.body.append(toElement(frame)));
+}
+
 // get Readability article info from the dom passed in
-async function getArticleFromDom(domString) {
+async function getArticleFromDom(domString, frames = []) {
   // parse the dom
   const parser = new DOMParser();
   const dom = parser.parseFromString(domString, "text/html");
@@ -679,6 +740,8 @@ async function getArticleFromDom(domString) {
   if (dom.documentElement.nodeName == "parsererror") {
     console.error("error while parsing");
   }
+
+  inlineFrames(dom, frames);
 
   const math = {};
 
@@ -690,7 +753,7 @@ async function getArticleFromDom(domString) {
   };
 
   dom.body.querySelectorAll('script[id^=MathJax-Element-]')?.forEach(mathSource => {
-    const type = mathSource.attributes.type.value
+    const type = mathSource.getAttribute('type')
     storeMathInfo(mathSource, {
       tex: mathSource.innerText,
       inline: type ? !type.includes('mode=display') : false
@@ -714,15 +777,17 @@ async function getArticleFromDom(domString) {
   });
 
   dom.body.querySelectorAll('.katex-mathml')?.forEach(kaTeXNode => {
+    const annotation = kaTeXNode.querySelector('annotation');
+    if (!annotation) return;
     storeMathInfo(kaTeXNode, {
-      tex: kaTeXNode.querySelector('annotation').textContent,
+      tex: annotation.textContent,
       inline: true
     });
   });
 
   dom.body.querySelectorAll('[class*=highlight-text],[class*=highlight-source]')?.forEach(codeSource => {
     const language = codeSource.className.match(/highlight-(?:text|source)-([a-z0-9]+)/)?.[1]
-    if (codeSource.firstChild.nodeName == "PRE") {
+    if (codeSource.firstChild?.nodeName == "PRE") {
       codeSource.firstChild.id = `code-lang-${language}`
     }
   });
@@ -738,7 +803,7 @@ async function getArticleFromDom(domString) {
   });
 
   dom.body.querySelectorAll('.codehilite > pre')?.forEach(codeSource => {
-    if (codeSource.firstChild.nodeName !== 'CODE' && !codeSource.className.includes('language')) {
+    if (codeSource.firstChild?.nodeName !== 'CODE' && !codeSource.className.includes('language')) {
       codeSource.id = `code-lang-text`;
     }
   });
@@ -756,8 +821,14 @@ async function getArticleFromDom(domString) {
   // mime type was used when the DOM was created.
   dom.documentElement.removeAttribute('class')
 
-  // simplify the dom into an article
-  const article = new Readability(dom).parse();
+  // simplify the dom into an article. Readability mutates the doc it's given, so hand it a clone.
+  // It returns null on pages it can't treat as an article (apps, feeds, unusual layouts):
+  // fall back to the whole body rather than failing the clip.
+  let article = new Readability(dom.cloneNode(true)).parse();
+  if (!article) {
+    dom.body.querySelectorAll('script, style, noscript, template').forEach(el => el.remove());
+    article = { title: dom.title, content: dom.body.innerHTML, textContent: dom.body.textContent };
+  }
 
   // get the base uri from the dom and attach it as important article info
   article.baseURI = dom.baseURI;
@@ -800,16 +871,17 @@ async function getArticleFromDom(domString) {
 // `selection` is a bool indicating whether we should just get the selected text
 async function getArticleFromContent(tabId, selection = false) {
   // run the content script function to get the details
-  const results = await browser.tabs.executeScript(tabId, { code: "getSelectionAndDom()" });
+  const results = await browser.tabs.executeScript(tabId, { code: GET_FRAMES_CODE, allFrames: true });
+  const page = splitFrames(results);
 
   // make sure we actually got a valid result
-  if (results && results[0] && results[0].dom) {
-    const article = await getArticleFromDom(results[0].dom, selection);
+  if (page.dom) {
+    const article = await getArticleFromDom(page.dom, page.frames);
 
     // if we're to grab the selection, and we've selected something,
     // replace the article content with the selection
-    if (selection && results[0].selection) {
-      article.content = results[0].selection;
+    if (selection && page.selection) {
+      article.content = page.selection;
     }
 
     //return the article
